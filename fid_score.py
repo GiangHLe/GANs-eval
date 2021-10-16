@@ -2,11 +2,16 @@
 The code was modified from 'https://github.com/mseitzer/pytorch-fid/blob/master/src/pytorch_fid/fid_score.py'
 '''
 import torch
+from torch.nn.functional import adaptive_avg_pool2d
+
 import os
 
 import numpy as np
+
+from scipy import linalg
 from PIL import Image
 from tqdm import tqdm
+from glob import glob
 from inception import InceptionV3
 
 from utils import grab_image_path
@@ -28,8 +33,11 @@ class FidDatatset(torch.utils.data.Dataset):
         return self.transform(image)    
 
 class FID():
-    def __init__(self, device, num_workers, dims=2048, batch_size=64, data_range=[-1,1]):
-        self.device = device
+    def __init__(self, device=None, num_workers=0, dims=2048, batch_size=64, data_range=[-1,1]):
+        if device:
+            self.device = device
+        else:
+            self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
         self.num_workers = num_workers
         self.dims = dims
         self.batch_size = batch_size
@@ -39,6 +47,17 @@ class FID():
         self.num_samples = None
         self.load_extractor(dims)
         self.end_extract = False
+        self.online = True
+
+        self.available_dataset_path = os.path.join(os.getcwd(), 'saved_dataset_statistic/')
+        os.makedirs(self.available_dataset_path, exist_ok=True)
+        exists_dataset = glob(os.path.join(self.available_dataset_path, '*.npy'))
+        if len(exists_dataset) == 0:
+            print('There is no available datset')
+            self.available_dataset = []
+        else:
+            self.available_dataset = [name.split('/')[-1][:-4] for name in exists_dataset]
+            print(f'Available datset: {self.available_dataset}')
 
     def load_extractor(self, dims):
         """Load the feature extracter model, InceptionV3 in this case"""
@@ -48,15 +67,9 @@ class FID():
         self.feature_extractor = InceptionV3([block_idx]).to(self.device)
         self.feature_extractor.eval()
 
-    def get_transform(self):
-        from torchvision import transforms as T
-        return T.Compose([
-            T.ToTensor(),
-            T.Resize(size=(299,299), interpolation=T.InterpolationMode.BILINEAR)
-        ])
-
     @torch.no_grad()
     def get_data_distribution(self, data_path):
+        self.online = False
         image_path = grab_image_path(data_path)
         if len(image_path) < self.batch_size:
             self.batch_size = len(image_path)
@@ -75,19 +88,19 @@ class FID():
         for batch in tqdm(dataloader):
             batch = self.adjust_range(batch.to(self.device), out_range=self.output_range)
             self.get_feature_vector(batch)
+        self.mu, self.sigma = self.calculate_activation_statistics()
             
     @torch.no_grad()
     def get_feature_vector(self, data):
-        from torch.nn.functional import adaptive_avg_pool2d
         # if the distribution is extracted directly from the training process, the 
         # problem may raise when number of synthesis image > number of line create 
         # by create_pred_map
-        if self.num_samples:
-            if data.shape[0] + self.start_idx >= self.num_samples:
-                remaining = self.num_samples-self.start_idx
-                idx = torch.randperm(remaining)
-                data = data[idx]
-                self.end_extract = True
+        data = data.to(self.device)
+        if data.shape[0] + self.start_idx >= self.num_samples:
+            remaining = self.num_samples-self.start_idx
+            idx = torch.randperm(remaining)
+            data = data[idx]
+            self.end_extract = True
         # auto compute mean and covariance matrix when the prediction map is full
         pred = self.feature_extractor(data)[0]
         if pred.size(2) != 1 or pred.size(3) != 1:
@@ -95,8 +108,8 @@ class FID():
         pred = pred.squeeze(3).squeeze(2).cpu().numpy()
         self.pred_arr[self.start_idx:(self.start_idx+pred.shape[0])] = pred
         self.start_idx+=data.shape[0]
-        if self.end_extract:
-            self.calculate_activation_statistics()
+        if self.end_extract and self.online:
+            self.mu, self.sigma = self.calculate_activation_statistics()
     
     def create_pred_map(self, num_samples):
         if num_samples < 50000:
@@ -110,9 +123,88 @@ class FID():
             self.get_data_distribution(data_path)
         mu = np.mean(self.pred_arr, axis=0)
         sigma = np.cov(self.pred_arr, rowvar=False)
-        self.mu = mu
-        self.sigma = sigma
+        del self.pred_arr # delete the unnecessary variable
+        del self.start_idx
         return mu, sigma
+
+    def extract_from_dataset(self, data_name='previous_data', data_path=None):
+        npy_path = os.path.join(self.available_dataset_path, f'{data_name}.npy')
+        if data_name in self.available_dataset:
+            # if exist dataset, load the mu and sigma
+            with open(npy_path, 'rb') as f:
+                self.based_mu = np.load(f)
+                self.based_sigma = np.load(f)
+        else:
+            if not data_path:
+                raise Exception('Need data_path')
+            if not os.path.exists(data_path):
+                print('Data path is not exists')
+            self.based_mu, self.based_sigma = self.calculate_activation_statistics(data_path=data_path)
+            with open(npy_path, 'wb') as f:
+                np.save(f, self.based_mu)
+                np.save(f, self.based_sigma)
+            print(f'Save the dataset statistics at {npy_path}')
+    
+    def compute_fid(self, path1=None, path2=None, eps=1e-16):
+        if os.path.exists(path1) and os.path.exists(path2):
+            if path1.endswith('npy'):
+                with open(path1, 'rb') as f:
+                    self.mu = np.load(f)
+                    self.sigma = np.load(f)
+            else:
+                self.mu, self.sigma = self.calculate_activation_statistics(data_name='data1', data_path=path1)
+            if path2.endswith('npy'):
+                with open(path2, 'rb') as f:
+                    self.based_mu = np.load(f)
+                    self.based_sigma = np.load(f)
+            else:
+                self.extract_from_dataset(data_name='data2', data_path=path2)
+        mu1 = np.atleast_1d(self.mu)
+        mu2 = np.atleast_1d(self.based_mu)
+
+        sigma1 = np.atleast_2d(self.sigma)
+        sigma2 = np.atleast_2d(self.based_sigma)
+
+        assert mu1.shape == mu2.shape, \
+            'Training and test mean vectors have different lengths'
+        assert sigma1.shape == sigma2.shape, \
+            'Training and test covariances have different dimensions'
+
+        diff = mu1 - mu2
+
+        # Product might be almost singular
+        covmean, _ = linalg.sqrtm(sigma1.dot(sigma2), disp=False)
+        if not np.isfinite(covmean).all():
+            msg = ('fid calculation produces singular product; '
+                'adding %s to diagonal of cov estimates') % eps
+            print(msg)
+            offset = np.eye(sigma1.shape[0]) * eps
+            covmean = linalg.sqrtm((sigma1 + offset).dot(sigma2 + offset))
+
+        # Numerical error might give slight imaginary component
+        if np.iscomplexobj(covmean):
+            if not np.allclose(np.diagonal(covmean).imag, 0, atol=1e-3):
+                m = np.max(np.abs(covmean.imag))
+                raise ValueError('Imaginary component {}'.format(m))
+            covmean = covmean.real
+
+        tr_covmean = np.trace(covmean)
+
+        return (diff.dot(diff) + np.trace(sigma1)
+                + np.trace(sigma2) - 2 * tr_covmean)
+
+    @staticmethod
+    def load_numpy(path):
+        with open(path, 'rb') as f:
+            mu = np.load(f)
+            sigma = np.load(f)
+        return mu, sigma
+
+    @staticmethod
+    def save_numpy(path, mu, sigma):
+        with open(path, 'wb') as f:
+            np.save(f, mu)
+            np.save(f, sigma)
 
     @staticmethod
     def adjust_range(input, in_range=[0,1], out_range=[-1,1]):
@@ -126,7 +218,36 @@ class FID():
             out = input*scale+bias
         return torch.clamp(out, min=out_range[0], max=out_range[1])
 
+if __name__=='__main__':
+    from argparse import ArgumentDefaultsHelpFormatter, ArgumentParser
+
+    parser = ArgumentParser(formatter_class=ArgumentDefaultsHelpFormatter)
+    parser.add_argument('--batch-size', type=int, default=64,
+                        help='Batch size to use')
+    parser.add_argument('--num-workers', type=int, default=0,
+                        help=('Number of processes to use for data loading. '
+                            'Defaults to `min(8, num_cpus)`'))
+    parser.add_argument('--device', type=str, default=None,
+                        help='Device to use. Like cuda, cuda:0 or cpu')
+    parser.add_argument('--dims', type=int, default=2048,
+                        choices=list(InceptionV3.BLOCK_INDEX_BY_DIM),
+                        help=('Dimensionality of Inception features to use. '
+                            'By default, uses pool3 features'))
+    parser.add_argument('path', type=str, nargs=2,
+                        help=('Paths to the generated images or '
+                            'to .npz statistic files'))
+    args = parser.parse_args()
+
+    path1, path2 = args.path
+    metric = FID(device=args.device, 
+                 num_workers=args.num_workers, 
+                 dims=args.dims, 
+                 batch_size=args.batch_size)
         
+    fid = metric.compute_fid(path1, path2)
+    print(fid)
+
+
     
 
 

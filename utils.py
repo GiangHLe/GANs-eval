@@ -12,3 +12,10 @@ def grab_image_path(data_path):
     image_path = reduce(lambda x,y: x+y, image_path)
     assert len(image_path)!=0, f'Only support the extensions {IMAGE_EXTENSIONS}, please check the extensions and the image directory path'
     return image_path
+
+def get_transform(image_size=(299,299)):
+    from torchvision import transforms as T
+    return T.Compose([
+        T.ToTensor(),
+        T.Resize(size=image_size, interpolation=T.InterpolationMode.BILINEAR)
+    ])
