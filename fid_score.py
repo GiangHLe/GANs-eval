@@ -1,6 +1,7 @@
 '''
 The code was modified from 'https://github.com/mseitzer/pytorch-fid/blob/master/src/pytorch_fid/fid_score.py'
 '''
+from numpy.core.defchararray import _startswith_dispatcher
 import torch
 from torch.nn.functional import adaptive_avg_pool2d
 
@@ -14,7 +15,7 @@ from tqdm import tqdm
 from glob import glob
 from inception import InceptionV3
 
-from utils import grab_image_path
+from utils import grab_image_path, get_transform
 
 IMAGE_EXTENSIONS = {'bmp', 'jpg', 'jpeg', 'pgm', 'png', 'ppm',
                     'tif', 'tiff', 'webp'}
@@ -33,7 +34,7 @@ class FidDatatset(torch.utils.data.Dataset):
         return self.transform(image)    
 
 class FID():
-    def __init__(self, device=None, num_workers=0, dims=2048, batch_size=64, data_range=[-1,1]):
+    def __init__(self, device=None, num_workers=0, dims=2048, batch_size=64, data_range=[0,1]):
         if device:
             self.device = device
         else:
@@ -47,7 +48,7 @@ class FID():
         self.num_samples = None
         self.load_extractor(dims)
         self.end_extract = False
-        self.online = True
+        # self.online = True
 
         self.available_dataset_path = os.path.join(os.getcwd(), 'saved_dataset_statistic/')
         os.makedirs(self.available_dataset_path, exist_ok=True)
@@ -69,13 +70,13 @@ class FID():
 
     @torch.no_grad()
     def get_data_distribution(self, data_path):
-        self.online = False
+        # self.online = False
         image_path = grab_image_path(data_path)
         if len(image_path) < self.batch_size:
             self.batch_size = len(image_path)
         dataset = FidDatatset(
             image_path=image_path,
-            transform=self.get_transform()
+            transform=get_transform()
         )
         dataloader = torch.utils.data.DataLoader(dataset,
                                                  batch_size=self.batch_size,
@@ -88,7 +89,6 @@ class FID():
         for batch in tqdm(dataloader):
             batch = self.adjust_range(batch.to(self.device), out_range=self.output_range)
             self.get_feature_vector(batch)
-        self.mu, self.sigma = self.calculate_activation_statistics()
             
     @torch.no_grad()
     def get_feature_vector(self, data):
@@ -108,13 +108,13 @@ class FID():
         pred = pred.squeeze(3).squeeze(2).cpu().numpy()
         self.pred_arr[self.start_idx:(self.start_idx+pred.shape[0])] = pred
         self.start_idx+=data.shape[0]
-        if self.end_extract and self.online:
-            self.mu, self.sigma = self.calculate_activation_statistics()
+        # if self.end_extract and self.online:
+        #     self.mu, self.sigma = self.calculate_activation_statistics()
     
     def create_pred_map(self, num_samples):
         if num_samples < 50000:
             print('Warning: The author of the FID paper recommends using at least 50,000 samples to get the most correct FID score.')
-        self.pred_arr = np.empty((num_samples, self.dims))
+        self.pred_arr = np.zeros((num_samples, self.dims))
         self.start_idx = 0
         self.num_samples = num_samples
 
@@ -123,47 +123,33 @@ class FID():
             self.get_data_distribution(data_path)
         mu = np.mean(self.pred_arr, axis=0)
         sigma = np.cov(self.pred_arr, rowvar=False)
-        del self.pred_arr # delete the unnecessary variable
+        self.end_extract = False
+        # del self.pred_arr # delete the used variable
         del self.start_idx
-        return mu, sigma
+        return [mu, sigma]
 
     def extract_from_dataset(self, data_name='previous_data', data_path=None):
         npy_path = os.path.join(self.available_dataset_path, f'{data_name}.npy')
         if data_name in self.available_dataset:
             # if exist dataset, load the mu and sigma
-            with open(npy_path, 'rb') as f:
-                self.based_mu = np.load(f)
-                self.based_sigma = np.load(f)
+            return self.load_numpy(npy_path)
         else:
             if not data_path:
                 raise Exception('Need data_path')
             if not os.path.exists(data_path):
                 print('Data path is not exists')
-            self.based_mu, self.based_sigma = self.calculate_activation_statistics(data_path=data_path)
-            with open(npy_path, 'wb') as f:
-                np.save(f, self.based_mu)
-                np.save(f, self.based_sigma)
+            statictis_data = self.calculate_activation_statistics(data_path=data_path)
+            self.save_numpy(npy_path, [self.pred_arr, statictis_data[0], statictis_data[1]])
+            del self.pred_arr
             print(f'Save the dataset statistics at {npy_path}')
+            return statictis_data
     
-    def compute_fid(self, path1=None, path2=None, eps=1e-16):
-        if os.path.exists(path1) and os.path.exists(path2):
-            if path1.endswith('npy'):
-                with open(path1, 'rb') as f:
-                    self.mu = np.load(f)
-                    self.sigma = np.load(f)
-            else:
-                self.mu, self.sigma = self.calculate_activation_statistics(data_name='data1', data_path=path1)
-            if path2.endswith('npy'):
-                with open(path2, 'rb') as f:
-                    self.based_mu = np.load(f)
-                    self.based_sigma = np.load(f)
-            else:
-                self.extract_from_dataset(data_name='data2', data_path=path2)
-        mu1 = np.atleast_1d(self.mu)
-        mu2 = np.atleast_1d(self.based_mu)
+    def compute_fid(self, data_dis1, data_dis2, eps=1e-16):
+        mu1 = np.atleast_1d(data_dis1[0])
+        mu2 = np.atleast_1d(data_dis2[0])
 
-        sigma1 = np.atleast_2d(self.sigma)
-        sigma2 = np.atleast_2d(self.based_sigma)
+        sigma1 = np.atleast_2d(data_dis1[1])
+        sigma2 = np.atleast_2d(data_dis2[1])
 
         assert mu1.shape == mu2.shape, \
             'Training and test mean vectors have different lengths'
@@ -198,25 +184,26 @@ class FID():
         with open(path, 'rb') as f:
             mu = np.load(f)
             sigma = np.load(f)
-        return mu, sigma
+        return [mu, sigma]
 
     @staticmethod
-    def save_numpy(path, mu, sigma):
+    def save_numpy(path, data):
         with open(path, 'wb') as f:
-            np.save(f, mu)
-            np.save(f, sigma)
+            for d in data:
+                np.save(f, d)
 
     @staticmethod
-    def adjust_range(input, in_range=[0,1], out_range=[-1,1]):
+    def adjust_range(data, in_range=[0,1], out_range=[-1,1]):
         '''
         adjust the dynamic range, from input range to the target range
+        In this work, the scaling was implemented in inception.py -> wait for the answer from the author of pytorch_fid to decide the transform
         '''
         if in_range!=out_range:
             scale = (np.float32(out_range[1])-np.float32(out_range[0]))/(
                 np.float32(in_range[1]-np.float32(in_range[0])))
             bias = np.float32(out_range[0])-np.float32(in_range[0])*scale
-            out = input*scale+bias
-        return torch.clamp(out, min=out_range[0], max=out_range[1])
+            data = data*scale+bias
+        return torch.clamp(data, min=out_range[0], max=out_range[1])
 
 if __name__=='__main__':
     from argparse import ArgumentDefaultsHelpFormatter, ArgumentParser
@@ -243,8 +230,10 @@ if __name__=='__main__':
                  num_workers=args.num_workers, 
                  dims=args.dims, 
                  batch_size=args.batch_size)
-        
-    fid = metric.compute_fid(path1, path2)
+    
+    dis_1 = metric.extract_from_dataset('data1', data_path=path1)
+    dis_2 = metric.extract_from_dataset('data2', data_path=path2)
+    fid = metric.compute_fid(dis_1, dis_2)
     print(fid)
 
 
